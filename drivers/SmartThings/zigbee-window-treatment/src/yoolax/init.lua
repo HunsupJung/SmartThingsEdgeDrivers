@@ -45,7 +45,6 @@ local function default_response_handler(driver, device, zb_message)
     local current_level = device:get_latest_state("main", capabilities.windowShadeLevel.ID, capabilities.windowShadeLevel.shadeLevel.NAME)
     if current_level then current_level = 100 - current_level end -- convert to the zigbee value
     local most_recent_setlevel = device:get_field(MOST_RECENT_SETLEVEL)
-    print(most_recent_setlevel..current_level)
     if current_level and most_recent_setlevel and current_level ~= most_recent_setlevel then
       if current_level > most_recent_setlevel then
         device:emit_event(capabilities.windowShade.windowShade.opening())
