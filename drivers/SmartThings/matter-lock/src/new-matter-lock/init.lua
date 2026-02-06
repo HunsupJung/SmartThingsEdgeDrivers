@@ -18,6 +18,7 @@ local clusters = require "st.matter.clusters"
 local im = require "st.matter.interaction_model"
 local utils = require "st.utils"
 local lock_utils = require "lock_utils"
+local security = require "st.security"
 
 local version = require "version"
 if version.api < 10 then
@@ -26,14 +27,19 @@ end
 
 local DoorLock = clusters.DoorLock
 local PowerSource = clusters.PowerSource
+local DoorLockFeatureMapAttr = {ID = 0xFFFC, cluster = 0x0101}
 
 local INITIAL_CREDENTIAL_INDEX = 1
 local ALL_INDEX = 0xFFFE
+local NAME_MAX_L = 10 --# 1. Max name
 local MIN_EPOCH_S = 0
 local MAX_EPOCH_S = 0xffffffff
 local THIRTY_YEARS_S = 946684800 -- 1970-01-01T00:00:00 ~ 2000-01-01T00:00:00
-
-local MODULAR_PROFILE_UPDATED = "__MODULAR_PROFILE_UPDATED"
+local PRIV_KEY_START = 15
+local PRIV_KEY_END = 78
+local PUB_KEY_START = 115
+local PUB_KEY_END = 242
+local PUB_KEY_PREFIX = "04"
 
 local RESPONSE_STATUS_MAP = {
   [DoorLock.types.DlStatus.SUCCESS] = "success",
@@ -65,30 +71,34 @@ local NEW_MATTER_LOCK_PRODUCTS = {
   {0x115f, 0x2801}, -- AQARA, U300
   {0x115f, 0x2807}, -- AQARA, U200 Lite
   {0x115f, 0x2804}, -- AQARA, U400
-  {0x115f, 0x286A}, -- AQARA, U200 US
   {0x147F, 0x0001}, -- U-tec
-  {0x147F, 0x0008}, -- Ultraloq, Bolt Smart Matter Door Lock
-  {0x144F, 0x4002}, -- Yale, Linus Smart Lock L2
-  {0x101D, 0x8110}, -- Yale, New Lock
+  {0x147F, 0x0005}, -- U-tec
+  {0x147F, 0x0007}, -- U-tec
+  {0x147F, 0x0010}, -- U-tec
+  {0x147F, 0x0011}, -- U-tec
+  {0x147F, 0x0012}, -- U-tec
   {0x1533, 0x0001}, -- eufy, E31
   {0x1533, 0x0002}, -- eufy, E30
   {0x1533, 0x0003}, -- eufy, C34
-  {0x1533, 0x000F}, -- eufy, FamiLock S3 Max
+  {0x1533, 0x000F}, -- eufy, eufy FamiLock S3 Max
   {0x1533, 0x0010}, -- eufy, FamiLock S3
-  {0x1533, 0x0011}, -- eufy, FamiLock E34
+  {0x1533, 0x0011}, -- eufy, eufy FamiLock E34
   {0x1533, 0x0012}, -- eufy, FamiLock E35
-  {0x1533, 0x0016}, -- eufy, FamiLock E32
-  {0x1533, 0x0014}, -- eufy, FamiLock E40
-  {0x135D, 0x00B1}, -- Nuki, Smart Lock Pro
-  {0x135D, 0x00B2}, -- Nuki, Smart Lock
-  {0x135D, 0x00C1}, -- Nuki, Smart Lock
-  {0x135D, 0x00A1}, -- Nuki, Smart Lock
-  {0x135D, 0x00B0}, -- Nuki, Smart Lock
-  {0x15F2, 0x0001}, -- Viomi, AiSafety Smart Lock E100
-  {0x158B, 0x0001}, -- Deasino, DS-MT01
-  {0x10E1, 0x2002}, -- VDA
-  {0x1421, 0x0042}, -- Kwikset Halo Select Plus
-  {0x1421, 0x0081}, -- Kwikset Aura Reach
+  {0x1421, 0x0041}, -- Kwikset
+  {0x1531, 0x0010}, -- Solity
+  {0xFFF1, 0x8005}, -- Solity, Test device
+  {0x144F, 0x4002}, -- Yale, Yale Linus Smart Lock L2
+  {0x101d, 0x8110}, -- Yale, new lock
+  {0x135D, 0x00A1}, -- Nuki, Nuki Smart Lock ULTRA
+  {0x135D, 0x00B0}, -- Nuki, Nuki Smart Lock
+  {0x135D, 0x00B1}, -- Nuki, Nuki Smart Lock Pro
+  {0x135D, 0x00B2}, -- Nuki, Nuki Smart Lock Pro
+  {0x135D, 0x00C1}, -- Nuki, Nuki Smart Lock Go
+  {0x1037, 0xA221}, -- NXP
+  {0x1236, 0xA538}, -- Allegion
+  {0x04E8, 0x6860}, -- STM
+  {0xFFF1, 0x8006}, -- STM
+  {0x10E1, 0x2002}  -- VDA
 }
 
 local battery_support = {
@@ -104,6 +114,9 @@ local profiling_data = {
 local subscribed_attributes = {
   [capabilities.lock.ID] = {
     DoorLock.attributes.LockState
+  },
+  [capabilities.doorState.ID] = {
+    DoorLock.attributes.DoorState
   },
   [capabilities.remoteControlStatus.ID] = {
     DoorLock.attributes.OperatingMode
@@ -183,6 +196,7 @@ local function component_to_endpoint(device, component_name)
 end
 
 local function device_init(driver, device)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! device_init"))
   device:set_component_to_endpoint_fn(component_to_endpoint)
   for cap_id, attributes in pairs(subscribed_attributes) do
     if device:supports_capability_by_id(cap_id) then
@@ -198,28 +212,154 @@ local function device_init(driver, device)
       end
     end
   end
+  if device.manufacturer_info.vendor_id == 0x135D then
+    device:add_subscribed_attribute(DoorLockFeatureMapAttr)
+  end
   device:subscribe()
  end
 
 local function device_added(driver, device)
-  device:emit_event(capabilities.lockAlarm.alarm.clear({state_change = true}))
-  local battery_feature_eps = device:get_endpoints(clusters.PowerSource.ID, {feature_bitmap = clusters.PowerSource.types.PowerSourceFeature.BATTERY})
-  if #battery_feature_eps > 0 then
-    device:send(clusters.PowerSource.attributes.AttributeList:read(device))
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! device_added"))
+end
+
+-- This function check busy_state and if busy_state is false, set it to true(current time)
+local function is_busy_state_set(device)
+  local c_time = os.time()
+  local busy_state = device:get_field(lock_utils.BUSY_STATE) or false
+  if busy_state == false or c_time - busy_state > 10 then
+    device:set_field(lock_utils.BUSY_STATE, c_time, {persist = true})
+    return false
   else
-    device:set_field(profiling_data.BATTERY_SUPPORT, battery_support.NO_BATTERY, { persist = true })
+    return true
   end
 end
 
+local function hex_string_to_octet_string(hex_string)
+  if hex_string == nil then
+    return nil
+  end
+  local octet_string = ""
+  for i = 1, #hex_string, 2 do
+      local hex = hex_string:sub(i, i + 1)
+      octet_string = octet_string .. string.char(tonumber(hex, 16))
+  end
+  return octet_string
+end
+
+local function create_group_id_resolving_key()
+  math.randomseed(os.time())
+  local result = string.format("%02x", math.random(0, 255))
+  for i = 1, 15 do
+    result = result .. string.format("%02x", math.random(0, 255))
+  end
+  return result
+end
+
+local function generate_keypair(device)
+  local request_opts = {
+    key_algorithm = {
+      type = "ec",
+      curve = "prime256v1"
+    },
+    signature_algorithm = "sha256",
+    return_formats = {
+      pem = true,
+      der = true
+    },
+    subject = {
+      common_name = "reader config"
+    },
+    validity_days = 36500,
+    x509_extensions = {
+      key_usage = {
+        critical = true,
+        digital_signature = true
+      },
+      certificate_policies = {
+        critical = true,
+        policy_2030_5_self_signed_client = true
+      }
+    }
+  }
+  local status, result = security.generate_self_signed_cert(request_opts)
+
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! key_der: %s", utils.bytes_to_hex_string(status.key_der)))
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! result: %s", result))
+
+  local privKey = string.sub(utils.bytes_to_hex_string(status.key_der), PRIV_KEY_START, PRIV_KEY_END)
+  local pubKey = PUB_KEY_PREFIX .. string.sub(utils.bytes_to_hex_string(status.key_der), PUB_KEY_START, PUB_KEY_END)
+
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! pubKey: %s", pubKey))
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! privKey: %s", privKey))
+
+  return privKey, pubKey
+end
+
+local function set_reader_config(device)
+  local reader_config_updated = device:get_field(lock_utils.ALIRO_READER_CONFIG_UPDATED) or nil
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! reader_config_updated1: %s", reader_config_updated))
+  if reader_config_updated == true then return end
+
+  local cmdName = "setReaderConfig"
+  local groupId = create_group_id_resolving_key()
+  local groupResolvingKey = nil
+  local aliro_ble_uwb_eps = device:get_endpoints(DoorLock.ID, {feature_bitmap = DoorLock.types.Feature.ALIROBLEUWB})
+  if #aliro_ble_uwb_eps > 0 then
+    groupResolvingKey = create_group_id_resolving_key()
+  end
+
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! groupId: %s", groupId))
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! groupResolvingKey: %s", groupResolvingKey))
+
+  local privKey, pubKey = generate_keypair(device)
+
+  -- Check busy state
+  if is_busy_state_set(device) then
+    local command_result_info = {
+      commandName = cmdName,
+      statusCode = "busy"
+    }
+    device:emit_event(capabilities.lockAliro.commandResult(
+      command_result_info, {state_change = true, visibility = {displayed = false}}
+    ))
+    return
+  end
+
+  -- Save values to field
+  device:set_field(lock_utils.COMMAND_NAME, cmdName, {persist = true})
+  device:set_field(lock_utils.VERIFICATION_KEY, pubKey, {persist = true})
+  device:set_field(lock_utils.GROUP_ID, groupId, {persist = true})
+  device:set_field(lock_utils.GROUP_RESOLVING_KEY, groupResolvingKey, {persist = true})
+
+  -- Send command
+  local ep = find_default_endpoint(device, clusters.DoorLock.ID)
+  device:send(
+    DoorLock.server.commands.SetAliroReaderConfig(
+      device, ep,
+      hex_string_to_octet_string(privKey),
+      hex_string_to_octet_string(pubKey),
+      hex_string_to_octet_string(groupId),
+      hex_string_to_octet_string(groupResolvingKey)
+    )
+  )
+  device:set_field(lock_utils.ALIRO_READER_CONFIG_UPDATED, true)
+end
+
 local function match_profile_modular(driver, device)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! match_profile_modular1"))
   local enabled_optional_component_capability_pairs = {}
   local main_component_capabilities = {}
   local modular_profile_name = "lock-modular"
+  local is_support_aliro = false
   for _, device_ep in pairs(device.endpoints) do
     for _, ep_cluster in pairs(device_ep.clusters) do
       if ep_cluster.cluster_id == DoorLock.ID then
         local clus_has_feature = function(feature_bitmap)
           return DoorLock.are_features_supported(feature_bitmap, ep_cluster.feature_map)
+        end
+        if clus_has_feature(DoorLock.types.Feature.DOOR_POSITION_SENSOR) then
+          device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! Door Positioning Sensor"))
+          table.insert(main_component_capabilities, capabilities.doorState.ID)
         end
         if clus_has_feature(DoorLock.types.Feature.USER) then
           table.insert(main_component_capabilities, capabilities.lockUsers.ID)
@@ -241,12 +381,14 @@ local function match_profile_modular(driver, device)
         end
         if clus_has_feature(DoorLock.types.Feature.ALIRO_PROVISIONING) then
           table.insert(main_component_capabilities, capabilities.lockAliro.ID)
+          is_support_aliro = true
         end
         break
       end
     end
   end
 
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! match_profile_modular2"))
   local supported_battery_type = device:get_field(profiling_data.BATTERY_SUPPORT)
   if supported_battery_type == battery_support.BATTERY_LEVEL then
     table.insert(main_component_capabilities, capabilities.batteryLevel.ID)
@@ -254,12 +396,20 @@ local function match_profile_modular(driver, device)
     table.insert(main_component_capabilities, capabilities.battery.ID)
   end
 
+  device.log.info_with({hub_logs=true}, string.format("Updating device profile to %s.", modular_profile_name))
   table.insert(enabled_optional_component_capability_pairs, {"main", main_component_capabilities})
   device:try_update_metadata({profile = modular_profile_name, optional_component_capabilities = enabled_optional_component_capability_pairs})
-  device:set_field(MODULAR_PROFILE_UPDATED, true)
+  device:set_field(lock_utils.MODULAR_PROFILE_UPDATED, true)
+
+  if is_support_aliro == true then
+    device.thread:call_with_delay(5, function(t)
+      set_reader_config(device)
+    end)
+  end
 end
 
 local function match_profile_switch(driver, device)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! match_profile_switch1"))
   local user_eps = device:get_endpoints(DoorLock.ID, {feature_bitmap = DoorLock.types.Feature.USER})
   local pin_eps = device:get_endpoints(DoorLock.ID, {feature_bitmap = DoorLock.types.Feature.PIN_CREDENTIAL})
   local week_schedule_eps = device:get_endpoints(DoorLock.ID, {feature_bitmap = DoorLock.types.Feature.WEEK_DAY_ACCESS_SCHEDULES})
@@ -295,10 +445,11 @@ local function match_profile_switch(driver, device)
 end
 
 local function info_changed(driver, device, event, args)
-  if device.profile.id == args.old_st_store.profile.id and not device:get_field(MODULAR_PROFILE_UPDATED) then
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! info_changed"))
+  if device.profile.id == args.old_st_store.profile.id and not device:get_field(lock_utils.MODULAR_PROFILE_UPDATED) then
     return
   end
-  device:set_field(MODULAR_PROFILE_UPDATED, nil)
+  device:set_field(lock_utils.MODULAR_PROFILE_UPDATED, nil)
   for cap_id, attributes in pairs(subscribed_attributes) do
     if device:supports_capability_by_id(cap_id) then
       for _, attr in ipairs(attributes) do
@@ -316,9 +467,11 @@ local function info_changed(driver, device, event, args)
   device:subscribe()
   device:emit_event(capabilities.lockAlarm.alarm.clear({state_change = true}))
   device:emit_event(capabilities.lockAlarm.supportedAlarmValues({"unableToLockTheDoor"}, {visibility = {displayed = false}})) -- lockJammed is madatory
+  device:emit_event(capabilities.doorState.supportedDoorStates({"open", "closed"}, {visibility = {displayed = false}})) -- open and closed are madatory
 end
 
 local function profiling_data_still_required(device)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! profiling_data_still_required"))
   for _, field in pairs(profiling_data) do
     if device:get_field(field) == nil then
       return true -- data still required if a field is nil
@@ -328,33 +481,33 @@ local function profiling_data_still_required(device)
 end
 
 local function match_profile(driver, device)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! match_profile"))
   if profiling_data_still_required(device) then return end
 
   if version.api >= 15 and version.rpc >= 9 then
+    device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! match_profile2"))
     match_profile_modular(driver, device)
   else
+    device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! match_profile3"))
     match_profile_switch(driver, device)
   end
 end
 
+ --# 2. read Battery info 
 local function do_configure(driver, device)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! do_configure1"))
+  local battery_feature_eps = device:get_endpoints(clusters.PowerSource.ID, {feature_bitmap = clusters.PowerSource.types.PowerSourceFeature.BATTERY})
+  if #battery_feature_eps > 0 then
+    device:send(clusters.PowerSource.attributes.AttributeList:read(device))
+  else
+    device:set_field(profiling_data.BATTERY_SUPPORT, battery_support.NO_BATTERY, { persist = true })
+  end
   match_profile(driver, device)
 end
 
 local function driver_switched(driver, device)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! driver_switched1"))
   match_profile(driver, device)
-end
-
--- This function check busy_state and if busy_state is false, set it to true(current time)
-local function is_busy_state_set(device)
-  local c_time = os.time()
-  local busy_state = device:get_field(lock_utils.BUSY_STATE) or false
-  if busy_state == false or c_time - busy_state > 10 then
-    device:set_field(lock_utils.BUSY_STATE, c_time, {persist = true})
-    return false
-  else
-    return true
-  end
 end
 
 -- Matter Handler
@@ -383,6 +536,30 @@ local function lock_state_handler(driver, device, ib, response)
   end)
 end
 
+local function door_state_handler(driver, device, ib, response)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! door_state_handler: %s", ib.data.value))
+  local DoorStateEnum = DoorLock.types.DoorStateEnum
+  local doorState = capabilities.doorState.doorState
+  local DOOR_STATE_MAP = {
+    [DoorStateEnum.DOOR_OPEN] = doorState.open,
+    [DoorStateEnum.DOOR_CLOSED] = doorState.closed,
+    [DoorStateEnum.DOOR_JAMMED] = doorState.jameed,
+    [DoorStateEnum.DOOR_FORCED_OPEN] = doorState.forcedOpen,
+    [DoorStateEnum.DOOR_UNSPECIFIED_ERROR] = doorState.unspecifiedError,
+    [DoorStateEnum.DOOR_AJAR] = doorState.ajar
+  }
+  device:emit_event(DOOR_STATE_MAP[ib.data.value]())
+
+  local supportedDoorStates = device:get_latest_state("main", capabilities.doorState.ID, capabilities.doorState.supportedDoorStates.NAME) or {}
+  for _, state in pairs(supportedDoorStates) do
+    if state == DOOR_STATE_MAP[ib.data.value].NAME then
+      return
+    end
+  end
+  table.insert(supportedDoorStates, DOOR_STATE_MAP[ib.data.value].NAME);
+  device:emit_event(capabilities.doorState.supportedDoorStates(supportedDoorStates, {visibility = {displayed = false}}))
+end
+
 ---------------------
 -- Operating Modes --
 ---------------------
@@ -394,7 +571,7 @@ local function operating_modes_handler(driver, device, ib, response)
     [op_type.VACATION] = true,
     [op_type.PRIVACY] = false,
     [op_type.NO_REMOTE_LOCK_UNLOCK] = false,
-    [op_type.PASSAGE] = false,
+    [op_type.PASSAGE] = true,
   }
   local result = opMode_map[ib.data.value]
   local unbolt_eps = device:get_endpoints(DoorLock.ID, {feature_bitmap = DoorLock.types.Feature.UNBOLT})
@@ -530,25 +707,11 @@ local function max_year_schedule_of_user_handler(driver, device, ib, response)
   device:emit_event(capabilities.lockSchedules.yearDaySchedulesPerUser(ib.data.value, {visibility = {displayed = false}}))
 end
 
-----------------
--- Aliro Util --
-----------------
-local function hex_string_to_octet_string(hex_string)
-  if hex_string == nil then
-    return nil
-  end
-  local octet_string = ""
-  for i = 1, #hex_string, 2 do
-      local hex = hex_string:sub(i, i + 1)
-      octet_string = octet_string .. string.char(tonumber(hex, 16))
-  end
-  return octet_string
-end
-
 -----------------------------------
 -- Aliro Reader Verification Key --
 -----------------------------------
 local function aliro_reader_verification_key_handler(driver, device, ib, response)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! aliro_reader_verification_key_handler"))
   if ib.data.value ~= nil then
     device:emit_event(capabilities.lockAliro.readerVerificationKey(
       utils.bytes_to_hex_string(ib.data.value), {visibility = {displayed = false}}
@@ -560,6 +723,7 @@ end
 -- Aliro Reader Group Identifier --
 -----------------------------------
 local function aliro_reader_group_id_handler(driver, device, ib, response)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! aliro_reader_group_id_handler: %s", ib.data.value))
   if ib.data.value ~= nil then
     device:emit_event(capabilities.lockAliro.readerGroupIdentifier(
       utils.bytes_to_hex_string(ib.data.value),
@@ -572,6 +736,7 @@ end
 -- Aliro Expedited Transaction Supported Protocol Versions --
 -------------------------------------------------------------
 local function aliro_group_resolving_key_handler(driver, device, ib, response)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! aliro_group_resolving_key_handler: %s", ib.data.value))
   if ib.data.value ~= nil then
     device:emit_event(capabilities.lockAliro.groupResolvingKey(
       utils.bytes_to_hex_string(ib.data.value),
@@ -584,6 +749,7 @@ end
 -- Aliro Group Resolving Key --
 -------------------------------
 local function aliro_protocol_versions_handler(driver, device, ib, response)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! aliro_supported_ble_uwb_protocol_versions_handler"))
   if ib.data.elements == nil then
     return
   end
@@ -599,6 +765,7 @@ end
 -- Aliro Supported BLE UWB Protocol Versions --
 -----------------------------------------------
 local function aliro_supported_ble_uwb_protocol_versions_handler(driver, device, ib, response)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! aliro_supported_ble_uwb_protocol_versions_handler"))
   if ib.data.elements == nil then
     return
   end
@@ -637,24 +804,49 @@ local function max_aliro_endpoint_key_handler(driver, device, ib, response)
   end
 end
 
+---------------------------------------------
+-- Feature Map of Door Lock --
+---------------------------------------------
+local function door_lock_feature_map_handler(driver, device, ib, response)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! door_lock_feature_map_handler: %s", ib.data.value))
+
+  for _, device_ep in pairs(device.endpoints) do
+    for _, ep_cluster in pairs(device_ep.clusters) do
+      if ep_cluster.cluster_id == DoorLock.ID then
+        if ep_cluster.feature_map == ib.data.value then
+          return
+        end
+        device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! door_lock_feature_map_handler2: %s", ep_cluster.feature_map))
+        ep_cluster.feature_map = ib.data.value
+      end
+    end
+  end
+
+  match_profile(driver, device)
+end
+
 ---------------------------------
 -- Power Source Attribute List --
 ---------------------------------
 local function handle_power_source_attribute_list(driver, device, ib, response)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! handle_power_source_attribute_list1"))
   for _, attr in ipairs(ib.data.elements) do
     -- mark if the device if BatPercentRemaining (Attribute ID 0x0C) or
     -- BatChargeLevel (Attribute ID 0x0E) is present and try profiling.
     if attr.value == 0x0C then
       device:set_field(profiling_data.BATTERY_SUPPORT, battery_support.BATTERY_PERCENTAGE, { persist = true })
+      device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! handle_power_source_attribute_list2"))
       match_profile(driver, device)
       return
     elseif attr.value == 0x0E then
       device:set_field(profiling_data.BATTERY_SUPPORT, battery_support.BATTERY_LEVEL, { persist = true })
+      device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! handle_power_source_attribute_list3"))
       match_profile(driver, device)
       return
     end
   end
 
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! handle_power_source_attribute_list4"))
   -- neither BatChargeLevel nor BatPercentRemaining were found. Re-profiling without battery.
   device:set_field(profiling_data.BATTERY_SUPPORT, battery_support.NO_BATTERY, { persist = true })
   match_profile(driver, device)
@@ -699,6 +891,7 @@ local function handle_lock(driver, device, command)
 end
 
 local function handle_unlock(driver, device, command)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! handle_unlock"))
   local unbolt_eps = device:get_endpoints(DoorLock.ID, {feature_bitmap = DoorLock.types.Feature.UNBOLT})
   local cota_cred = device:get_field(lock_utils.COTA_CRED)
   local ep = device:component_to_endpoint(command.component)
@@ -1273,6 +1466,10 @@ local function handle_update_user(driver, device, command)
   local cmdName = "updateUser"
   local userIdx = command.args.userIndex
   local userName = command.args.userName
+  local userNameMatter = userName --# 1. Max Name
+  if #userNameMatter > NAME_MAX_L then
+    userNameMatter = string.sub(userNameMatter, 1, NAME_MAX_L)
+  end
   local userType = command.args.userType
   local userTypeMatter = DoorLock.types.UserTypeEnum.UNRESTRICTED_USER
   if userType == "guest" then
@@ -1303,12 +1500,12 @@ local function handle_update_user(driver, device, command)
     DoorLock.server.commands.SetUser(
       device, ep,
       DoorLock.types.DataOperationTypeEnum.MODIFY, -- Operation Type: Add(0), Modify(2)
-      userIdx,        -- User Index
-      userName,       -- User Name
-      nil,            -- Unique ID
-      nil,            -- User Status
-      userTypeMatter, -- User Type
-      nil             -- Credential Rule
+      userIdx,
+      userNameMatter,  --# 1. Max Name
+      nil, -- Unique ID
+      nil, -- User Status
+      userTypeMatter,
+      nil  -- Credential Rule
     )
   )
 end
@@ -1530,13 +1727,15 @@ local function handle_add_credential(driver, device, command)
   -- Get parameters
   local cmdName = "addCredential"
   local userIdx = command.args.userIndex
-  if userIdx == 0 then
-    userIdx = nil
-  end
   local userType = command.args.userType
   local userTypeMatter = DoorLock.types.UserTypeEnum.UNRESTRICTED_USER
   if userType == "guest" then
     userTypeMatter = DoorLock.types.UserTypeEnum.SCHEDULE_RESTRICTED_USER
+  end
+  if userIdx == 0 then
+    userIdx = nil
+  else
+    userTypeMatter = nil --# 3. error fix
   end
   local credential = {
     credential_type = DoorLock.types.CredentialTypeEnum.PIN,
@@ -1661,18 +1860,7 @@ local function set_pin_response_handler(driver, device, ib, response)
     if cmdName == "addCredential" then
       add_credential_to_table(device, userIdx, credIdx, "pin")
     end
-
-    -- Update commandResult
-    local command_result_info = {
-      commandName = cmdName,
-      userIndex = userIdx,
-      credentialIndex = credIdx,
-      statusCode = status
-    }
-    device:emit_event(capabilities.lockCredentials.commandResult(
-      command_result_info, {state_change = true, visibility = {displayed = false}}
-    ))
-
+--# 4. Schedule
     -- If User Type is Guest and device support schedule, add default schedule
     local week_schedule_eps = device:get_endpoints(DoorLock.ID, {feature_bitmap = DoorLock.types.Feature.WEEK_DAY_ACCESS_SCHEDULES})
     local year_schedule_eps = device:get_endpoints(DoorLock.ID, {feature_bitmap = DoorLock.types.Feature.YEAR_DAY_ACCESS_SCHEDULES})
@@ -1695,7 +1883,17 @@ local function set_pin_response_handler(driver, device, ib, response)
           MAX_EPOCH_S
         )
       )
-    else
+    else  --# 4. Schedule
+      -- Update commandResult
+      local command_result_info = {
+        commandName = cmdName,
+        userIndex = userIdx,
+        credentialIndex = credIdx,
+        statusCode = status
+      }
+      device:emit_event(capabilities.lockCredentials.commandResult(
+        command_result_info, {state_change = true, visibility = {displayed = false}}
+      ))
       device:set_field(lock_utils.BUSY_STATE, false, {persist = true})
     end
     return
@@ -2370,7 +2568,21 @@ local function set_year_day_schedule_handler(driver, device, ib, response)
     status = "invalidCommand"
   end
 
-  if cmdName == "defaultSchedule" then
+  if cmdName == "defaultSchedule" then --# 4. Schedule
+    local cmdName = "addCredential"
+    local credIdx = device:get_field(lock_utils.CRED_INDEX)
+
+    -- Update commandResult
+    local command_result_info = {
+      commandName = cmdName,
+      userIndex = userIdx,
+      credentialIndex = credIdx,
+      statusCode = status
+    }
+    device:emit_event(capabilities.lockCredentials.commandResult(
+      command_result_info, {state_change = true, visibility = {displayed = false}}
+    ))
+    device:set_field(lock_utils.BUSY_STATE, false, {persist = true})
     return
   end
 
@@ -2504,7 +2716,7 @@ local function lock_op_event_handler(driver, device, ib, response)
   elseif opSource.value == Source.BIOMETRIC then
     opSource = "keypad"
   elseif opSource.value == Source.ALIRO then
-    opSource = nil
+    opSource = "digitalKey" --# 5. history
   else
     opSource =nil
   end
@@ -2524,6 +2736,7 @@ local function handle_refresh(driver, device, command)
 end
 
 local function handle_set_reader_config(driver, device, command)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! handle_set_reader_config"))
   local cmdName = "setReaderConfig"
   local signingKey = command.args.signingKey
   local verificationKey = command.args.verificationKey
@@ -2546,6 +2759,21 @@ local function handle_set_reader_config(driver, device, command)
     return
   end
 
+  local reader_config_updated = device:get_field(lock_utils.ALIRO_READER_CONFIG_UPDATED) or nil
+  if reader_config_updated == true then
+    device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! reader_config_updated: true"))
+    -- Update commandResult
+    local command_result_info = {
+      commandName = cmdName,
+      statusCode = "success"
+    }
+    device:emit_event(capabilities.lockAliro.commandResult(
+      command_result_info, {state_change = true, visibility = {displayed = false}}
+    ))
+    device:set_field(lock_utils.BUSY_STATE, false, {persist = true})
+    return
+  end
+
   -- Save values to field
   device:set_field(lock_utils.COMMAND_NAME, cmdName, {persist = true})
   device:set_field(lock_utils.VERIFICATION_KEY, verificationKey, {persist = true})
@@ -2563,48 +2791,19 @@ local function handle_set_reader_config(driver, device, command)
       hex_string_to_octet_string(groupResolvingKey) -- Group resolving key
     )
   )
+  device:set_field(lock_utils.ALIRO_READER_CONFIG_UPDATED, true)
 end
 
 local function set_aliro_reader_config_handler(driver, device, ib, response)
+  device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! set_aliro_reader_config_handler"))
   -- Get result
   local cmdName = device:get_field(lock_utils.COMMAND_NAME)
-  local verificationKey = device:get_field(lock_utils.VERIFICATION_KEY)
-  local groupId = device:get_field(lock_utils.GROUP_ID)
-  local groupResolvingKey = device:get_field(lock_utils.GROUP_RESOLVING_KEY)
-
-  local status = "success"
-  if ib.status == DoorLock.types.DlStatus.FAILURE then
-    status = "failure"
+  local status = "failure"
+  if ib.status == DoorLock.types.DlStatus.SUCCESS then
+    status = "success"
+    device.log.info_with({hub_logs=true}, string.format("!!!!!!!!!!! set_aliro_reader_config_handler: true"))
   elseif ib.status == DoorLock.types.DlStatus.INVALID_FIELD then
     status = "invalidCommand"
-  elseif ib.status == DoorLock.types.DlStatus.SUCCESS then
-    if verificationKey ~= nil then
-      device:emit_event(capabilities.lockAliro.readerVerificationKey(
-        verificationKey,
-        {
-          state_change = true,
-          visibility = {displayed = false}
-        }
-      ))
-    end
-    if groupId ~= nil then
-      device:emit_event(capabilities.lockAliro.readerGroupIdentifier(
-        groupId,
-        {
-          state_change = true,
-          visibility = {displayed = false}
-        }
-      ))
-    end
-    if groupResolvingKey ~= nil then
-      device:emit_event(capabilities.lockAliro.groupResolvingKey(
-        groupResolvingKey,
-        {
-          state_change = true,
-          visibility = {displayed = false}
-        }
-      ))
-    end
   end
 
   -- Update commandResult
@@ -2884,6 +3083,7 @@ local new_matter_lock_handler = {
     attr = {
       [DoorLock.ID] = {
         [DoorLock.attributes.LockState.ID] = lock_state_handler,
+        [DoorLock.attributes.DoorState.ID] = door_state_handler,
         [DoorLock.attributes.OperatingMode.ID] = operating_modes_handler,
         [DoorLock.attributes.NumberOfTotalUsersSupported.ID] = total_users_supported_handler,
         [DoorLock.attributes.NumberOfPINUsersSupported.ID] = pin_users_supported_handler,
@@ -2900,6 +3100,7 @@ local new_matter_lock_handler = {
         [DoorLock.attributes.AliroBLEAdvertisingVersion.ID] = aliro_ble_advertising_version_handler,
         [DoorLock.attributes.NumberOfAliroCredentialIssuerKeysSupported.ID] = max_aliro_credential_issuer_key_handler,
         [DoorLock.attributes.NumberOfAliroEndpointKeysSupported.ID] = max_aliro_endpoint_key_handler,
+        [DoorLockFeatureMapAttr.ID] = door_lock_feature_map_handler,
       },
       [PowerSource.ID] = {
         [PowerSource.attributes.AttributeList.ID] = handle_power_source_attribute_list,
